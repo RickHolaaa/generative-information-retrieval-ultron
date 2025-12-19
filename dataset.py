@@ -1,6 +1,6 @@
 import json
 import os
-from math import log2, log10
+from math import log10
 from pathlib import Path
 from typing import List, NamedTuple, Tuple
 
@@ -33,44 +33,8 @@ class PQRetriever(PQ):
         return np.argsort(dists)[:k]
 
 
-def _is_power_of_two(x: int) -> bool:
-    return x > 0 and (x & (x - 1)) == 0
-
-
-def unpack_pq_codes(packed: np.ndarray, m: int, nbits: int) -> np.ndarray:
-    """
-    Unpack FAISS PQ packed codes into shape (N, m) ints in [0, 2^nbits-1].
-
-    packed: (N, code_size_bytes) uint8
-    returns: (N, m) int64
-    """
-    if packed.ndim != 2:
-        raise ValueError(f"packed codes must be 2D, got shape {packed.shape}")
-
-    N = packed.shape[0]
-    K = 1 << nbits
-    out = np.zeros((N, m), dtype=np.int64)
-
-    # Interpret packed bytes as bitstream (little-endian within each byte)
-    # FAISS packs codes consecutively: code0 (nbits), code1 (nbits), ...
-    for i in range(N):
-        bitpos = 0
-        for j in range(m):
-            val = 0
-            for b in range(nbits):
-                byte_idx = (bitpos + b) // 8
-                bit_idx = (bitpos + b) % 8
-                bit = (packed[i, byte_idx] >> bit_idx) & 1
-                val |= bit << b
-            out[i, j] = val
-            bitpos += nbits
-            if out[i, j] >= K:
-                raise ValueError("Unpacked code out of range; check nbits/unpack.")
-    return out
-
-
 class IVFPQRetriever:
-    """Inverted File + Product Quantization over residuals (training artifacts only)."""
+    """Inverted File Product Quantization Retriever"""
 
     def __init__(
         self,
@@ -79,24 +43,18 @@ class IVFPQRetriever:
         num_fine_clusters: int,
         vec_dim: int = 128,
     ):
-        if not _is_power_of_two(num_fine_clusters):
-            raise ValueError(
-                f"num_fine_clusters must be power of two, got {num_fine_clusters}"
-            )
-
         self.num_coarse = num_coarse
         self.num_fine_subspace = num_fine_subspace
         self.num_fine_clusters = num_fine_clusters
         self.vec_dim = vec_dim
-
-        self.nbits = int(log2(num_fine_clusters))  # 2^nbits == K
         self.coarse_centroids = None
         self.fine_pq = None
 
     def fit(self, X: np.ndarray) -> None:
+        """Train IVF-PQ on database vectors"""
         X = X.astype(np.float32)
 
-        # Step 1: Coarse quantization
+        # Step 1: Coarse quantization - k-means on full vectors
         print(f"Training coarse quantization with {self.num_coarse} clusters...")
         coarse_kmeans = faiss.Kmeans(
             self.vec_dim, self.num_coarse, niter=20, verbose=True
@@ -104,39 +62,42 @@ class IVFPQRetriever:
         coarse_kmeans.train(X)
         self.coarse_centroids = coarse_kmeans.centroids
 
-        # Step 2: Assign to coarse
+        # Step 2: Assign vectors to coarse clusters
         coarse_index = faiss.IndexFlatL2(self.vec_dim)
         coarse_index.add(self.coarse_centroids)
         _, coarse_assignments = coarse_index.search(X, 1)
         coarse_assignments = coarse_assignments.flatten()
 
-        # Step 3: Train PQ on residuals
-        residuals = X - self.coarse_centroids[coarse_assignments]
+        # Step 3: Train fine PQ on residuals
         print(
-            f"Training fine PQ on residuals: m={self.num_fine_subspace}, "
-            f"K={self.num_fine_clusters} (nbits={self.nbits})"
+            f"Training fine PQ with {self.num_fine_subspace} subspaces and {self.num_fine_clusters} clusters..."
         )
-        self.fine_pq = faiss.IndexPQ(self.vec_dim, self.num_fine_subspace, self.nbits)
+        residuals = X - self.coarse_centroids[coarse_assignments]
+
+        self.fine_pq = faiss.IndexPQ(self.vec_dim, self.num_fine_subspace, 8)
         self.fine_pq.train(residuals)
         self.fine_pq.add(residuals)
 
     def encode(self, X: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Return (coarse_ids, packed_fine_codes)."""
+        """Encode vectors into (coarse_ids, fine_codes)"""
         X = X.astype(np.float32)
 
+        # Get coarse assignments
         coarse_index = faiss.IndexFlatL2(self.vec_dim)
         coarse_index.add(self.coarse_centroids)
         _, coarse_ids = coarse_index.search(X, 1)
         coarse_ids = coarse_ids.flatten()
 
+        # Get fine codes (residuals); IndexPQ uses sa_encode for returning codes
         residuals = X - self.coarse_centroids[coarse_ids]
-        packed_fine_codes = self.fine_pq.sa_encode(residuals)  # packed bytes
+        fine_codes = self.fine_pq.sa_encode(residuals)
 
-        return coarse_ids, packed_fine_codes
+        return coarse_ids, fine_codes
 
 
 class Sift1mDataset(Dataset):
     VECTOR_DIM = 128
+
     _DATASET_SIZE = {"database": 1_000_000, "test": 10_000}
 
     def __init__(self, split: str, args, index_path: str) -> None:
@@ -146,19 +107,16 @@ class Sift1mDataset(Dataset):
         self.dataset_split = split
         self.index_path = Path(index_path)
         self.dataset_path = Path(args.dataset_path) / args.num_samples
-
         use_ivf = getattr(args, "use_ivf_pq", False)
         if use_ivf:
-            self.vecid_len = 1 + args.num_fine_subspace  # coarse + M fine tokens
-            vocab_size = args.num_coarse_clusters + (
-                args.num_fine_subspace * args.num_fine_clusters
-            )
-            self.num_digits = len(str(vocab_size - 1))
+            self.vecid_len = 1 + args.num_fine_subspace  # 1 coarse + fine codes
+            max_tok = max(args.num_coarse_clusters - 1, args.num_fine_clusters - 1)
+            self.num_digits = len(str(max_tok))
         else:
             self.vecid_len = args.num_subspace
             self.num_digits = int(log10(args.num_clusters)) + 1
-
         self.vector_name = "query" if self.dataset_split == "test" else "key"
+
         self.index_path.mkdir(parents=True, exist_ok=True)
 
         self._to_features(args.num_subspace, args.num_clusters)
@@ -199,28 +157,22 @@ class Sift1mDataset(Dataset):
         use_ivf = getattr(self.args, "use_ivf_pq", False)
 
         if use_ivf:
-            C = self.args.num_coarse_clusters
-            M = self.args.num_fine_subspace
-            K = self.args.num_fine_clusters
-
-            if not _is_power_of_two(K):
-                raise ValueError("num_fine_clusters must be power of two for IVF-PQ.")
-            nbits = int(log2(K))
-
-            # If already cached, just load database_code directly.
-            db_code_file = self.index_path / "database_code.npy"
+            # IVF-PQ path
+            ivf_pq = IVFPQRetriever(
+                num_coarse=self.args.num_coarse_clusters,
+                num_fine_subspace=self.args.num_fine_subspace,
+                num_fine_clusters=self.args.num_fine_clusters,
+                vec_dim=self.VECTOR_DIM,
+            )
 
             if self.dataset_split == "database":
-                ivf_pq = IVFPQRetriever(
-                    num_coarse=C,
-                    num_fine_subspace=M,
-                    num_fine_clusters=K,
-                    vec_dim=self.VECTOR_DIM,
-                )
+                # Train IVF-PQ on database
                 ivf_pq.fit(dataset["database"]["key"].numpy())
-                coarse_ids, packed = ivf_pq.encode(dataset["database"]["key"].numpy())
+                coarse_ids, fine_codes = ivf_pq.encode(
+                    dataset["database"]["key"].numpy()
+                )
 
-                # Save artifacts
+                # Save IVF-PQ artifacts
                 np.save(
                     self.index_path / "coarse_centroids.npy", ivf_pq.coarse_centroids
                 )
@@ -228,36 +180,23 @@ class Sift1mDataset(Dataset):
                     ivf_pq.fine_pq, str(self.index_path / "fine_pq.index")
                 )
                 np.save(self.index_path / "coarse_ids.npy", coarse_ids)
-                np.save(self.index_path / "fine_codes_packed.npy", packed)
-
-                fine_codes = unpack_pq_codes(
-                    packed.astype(np.uint8), m=M, nbits=nbits
-                )  # (N,M)
-
-                # Offset fine tokens into disjoint ranges: C + s*K + code
-                offsets = (C + np.arange(M) * K).reshape(1, M)  # (1,M)
-                fine_tok = fine_codes + offsets  # (N,M)
-
-                database_code = np.concatenate(
-                    [
-                        coarse_ids.reshape(-1, 1).astype(np.int64),
-                        fine_tok.astype(np.int64),
-                    ],
-                    axis=1,
-                )  # (N, 1+M)
-
-                np.save(db_code_file, database_code)
-
+                np.save(self.index_path / "fine_codes.npy", fine_codes)
             else:
-                if not db_code_file.exists():
-                    raise FileNotFoundError(
-                        f"Missing {db_code_file}. Build database split first."
-                    )
-                database_code = np.load(db_code_file)
+                # Load trained IVF-PQ and encode database for labels
+                ivf_pq.coarse_centroids = np.load(
+                    self.index_path / "coarse_centroids.npy"
+                )
+                ivf_pq.fine_pq = faiss.read_index(
+                    str(self.index_path / "fine_pq.index")
+                )
 
+                # Use database codes for neighbor labels
+                coarse_ids = np.load(self.index_path / "coarse_ids.npy")
+                fine_codes = np.load(self.index_path / "fine_codes.npy")
+
+            database_code = np.hstack([coarse_ids.reshape(-1, 1), fine_codes])
             self.codewords = None
             database_code = torch.from_numpy(database_code).long()
-
         else:
             # Standard PQ path
             pq = PQRetriever(M=num_subspace, Ks=k)
@@ -267,23 +206,23 @@ class Sift1mDataset(Dataset):
             else:
                 pq.codewords = np.load(self.index_path / "codebook.npy")
                 pq.Ds = self.VECTOR_DIM // num_subspace
-
-            database_code = pq.encode(dataset["database"]["key"].numpy())  # (N, M)
-            self.codewords = torch.from_numpy(pq.codewords)  # (M, K, dim/M)
+            database_code = pq.encode(
+                dataset["database"]["key"].numpy()
+            )  # (num_samples, M)
+            self.codewords = torch.from_numpy(pq.codewords)  # (M, K, vec_dim / M)
             database_code = torch.from_numpy(database_code).long()
 
         print("generate features...")
         self.features = [
             Feature(
                 x=emb.unsqueeze(dim=0),
-                id=uid,
+                id=id,
                 label=database_code[neighbors],
                 neighbors=neighbors,
                 dist=dist,
             )
-            for emb, uid, neighbors, dist in zip(*dataset[self.dataset_split].values())
+            for emb, id, neighbors, dist in zip(*dataset[self.dataset_split].values())
         ]
-
         if self.dataset_split == "database":
             self.id_table = {
                 self.vecid_to_str(f.label[0]): f.id.item() for f in self.features
@@ -359,6 +298,7 @@ def build_dataset(
     index = faiss.IndexFlatL2(x.shape[1])
     index.add(x)
     dist, indices = index.search(x, k)
+    dataset_path: Path
     _save(x, unique_id, indices, dist, dataset_path, "database")
 
     # testing set
@@ -376,3 +316,23 @@ if __name__ == "__main__":
 
     set_seed()
     build_dataset("./data", k=100, num_samples=10_000, noise_factor=0.0)
+
+    # parser = argparse.ArgumentParser()
+    # parser.add_argument("--dataset_path", type=str, default="./data/10K")
+    # parser.add_argument("--num_subspace", type=int, default=4)
+    # parser.add_argument("--num_clusters", type=int, default=128)
+    # args = parser.parse_args()
+
+    # folder = "test"
+    # dataloader = DataLoader(Sift1mDataset(split="test", args=args, index_path=Path("./saved_models")/folder), batch_size=100, shuffle=True, pin_memory=True)
+    # print(len(dataloader.dataset))
+
+    # batch: Feature
+    # for batch in dataloader:
+    #     print(batch.x.shape, batch.id.shape, batch.label.shape, batch.neighbors, batch.dist.shape)
+    #     # print(type(batch.x))
+    #     # print(type(batch.id))
+    #     # print(batch.x.shape)    # (batch_size, 128)
+    #     # print(batch.x.shape)    # (batch_size,)
+    #     # print(batch.id)
+    #     break
