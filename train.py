@@ -20,26 +20,43 @@ def cross_entropy(logits: Tensor, soft_targets: Tensor) -> Tensor:
     return loss.mean()  # average over batch
 
 
-def compute_loss(model: T5ForPretrain, codewords: Tensor, x: Tensor, labels: Tensor) -> Tensor:
+def compute_loss(model: T5ForPretrain, codewords: Tensor, x: Tensor, labels: Tensor, lam=0.2, num_negs=20) -> Tensor:
     '''
         codewords:  (M, K, vec_dim / M)
         x:          (batch_size, seq_len, vec_dim)
         label:      (batch_size, num_neighbors, vecid_len)
     '''
-
     loss = 0
     vecid_len = labels.size(2)
     for i in range(vecid_len):
         outputs: Seq2SeqLMOutput = model(decoder_inputs_embeds=x)
         next_logits = outputs.logits[:, -1, :]
 
-        # retrieval loss
-
         # indexing loss
         tokid = labels[:, 0, i]
         indexing_loss = model.loss_fct(next_logits, tokid)
 
-        loss += indexing_loss
+        # retrieval loss
+        L = min(num_negs, labels.size(1) - 1)
+        if L > 0:
+            negs = labels[:, 1 : 1 + L, i]  # (B, L)
+
+            # optional: deduplicate negatives per row (nice-to-have)
+            # simple version: keep as-is
+
+            pos_score = next_logits.gather(1, tokid.unsqueeze(1))  # (B,1)
+            neg_score = next_logits.gather(1, negs)  # (B,L)
+            scores = torch.cat([pos_score, neg_score], dim=1)  # (B,1+L)
+
+            targets = torch.zeros(
+                scores.size(0), dtype=torch.long, device=scores.device
+            )
+            retr_loss = F.cross_entropy(scores, targets)
+        else:
+            retr_loss = 0.0
+
+        loss = loss + indexing_loss + lam * retr_loss
+        
         centroid = torch.index_select(codewords[i], dim=0, index=tokid)         # (batch_size, vec_dim / M)
         centroid = model.output_proj(centroid.to(x)).unsqueeze(dim=1)           # (batch_size, 1, vec_dim)
         x = torch.cat([x, centroid], dim=1)                                     # (batch_size, vecid_len, vec_dim)
@@ -73,7 +90,7 @@ def main(args):
         for batch in pbar:
             # print(batch.x.shape, batch.label.shape, batch.label[0])
             inputs = (batch.x.to(device, non_blocking=True), batch.label.to(device, non_blocking=True))
-            loss = compute_loss(model, codewords, *inputs)
+            loss = compute_loss(model, codewords, *inputs, lam=3, num_negs=50)
             losses.append(loss.item())
 
             optimizer.zero_grad()
@@ -83,7 +100,6 @@ def main(args):
             scheduler.step()
 
             pbar.set_postfix_str(f"loss: {loss:.4f}")
-        
         if (epoch + 1) % 100 == 0:
             save_model(model, path, f"epoch{epoch + 1}")
             plot_loss(losses, save_dir=path)
