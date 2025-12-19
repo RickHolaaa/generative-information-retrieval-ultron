@@ -1,0 +1,8 @@
+numpy==1.26.4
+transformers==4.53.3
+protobuf==4.21.12
+tensorflow==2.16.1
+tensorflow-datasets==4.9.9
+nanopq==0.2.2
+matplotlib==3.10.6
+faiss-cpu==1.12.0
