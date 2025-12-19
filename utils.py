@@ -89,6 +89,12 @@ def get_args(file_name: str):
     parser.add_argument(
         "--num_samples", type=str, default="10K", choices=["10K", "100K"]
     )
+    
+    # Quantizer type: 'pq' for Product Quantization, 'hierarchical' for Hierarchical Clustering
+    parser.add_argument(
+        "--quantizer", type=str, default="pq", choices=["pq", "hierarchical"],
+        help="Quantization method: 'pq' (Product Quantization) or 'hierarchical' (Hierarchical Clustering)"
+    )
 
     if file_name == "train.py":
         parser.add_argument("--batch_size", type=int, default=500)  # 1000 for 100K

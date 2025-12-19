@@ -50,7 +50,8 @@ def main(args):
     device = "cuda:0"
     model = load_model(args).to(device)
     # folder = get_time()
-    folder = args.num_samples
+    # Include quantizer type in folder name for organization
+    folder = f"{args.num_samples}_{args.quantizer}"
     path = Path(args.save_path)/folder
     save_config(args, path)
 

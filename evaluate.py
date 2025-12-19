@@ -124,7 +124,8 @@ def constrained_beam_search(
 
 def main(args):
     device = "cuda:0"
-    path = Path(args.save_path) / args.num_samples
+    # Include quantizer type in folder name
+    path = Path(args.save_path) / f"{args.num_samples}_{args.quantizer}"
     model = load_model(args).to(device)
     ckpt = f"epoch{args.epochs}"
     model.load_state_dict(torch.load(path / f"{ckpt}.pth"))

@@ -6,3 +6,4 @@ tensorflow-datasets==4.9.9
 nanopq==0.2.2
 matplotlib==3.10.6
 faiss-cpu==1.12.0
+scikit-learn==1.5.2

@@ -16,9 +16,19 @@ class T5ForPretrain(T5ForConditionalGeneration):
         self.args = args
         self.config: T5Config
 
+        # Determine input dimension based on quantizer type
+        quantizer_type = getattr(args, 'quantizer', 'pq')
+        if quantizer_type == 'hierarchical':
+            # Hierarchical clustering uses full vector dimension for centroids
+            input_dim = Sift1mDataset.VECTOR_DIM
+        else:
+            # PQ uses sub-vector dimension
+            input_dim = Sift1mDataset.VECTOR_DIM // args.num_subspace
+        
         # for dimension alignment
         self.output_proj = nn.Sequential(
-            nn.Linear(Sift1mDataset.VECTOR_DIM // args.num_subspace, self.config.d_model // 2),
+            nn.Linear(input_dim, self.config.d_model // 2),
+            nn.GELU(),  # Added activation for better representation learning
             nn.Linear(self.config.d_model // 2, self.config.d_model),
         )
 

@@ -14,6 +14,8 @@ from nanopq import PQ
 from torch import Tensor, LongTensor
 from torch.utils.data import Dataset, DataLoader
 
+from hierarchical import HierarchicalQuantizer
+
 
 class Feature(NamedTuple):
     x: Tensor
@@ -31,6 +33,11 @@ class PQRetriever(PQ):
         dtable = self.dtable(q)
         dists = dtable.adist(self.codewords)
         return np.argsort(dists)[:k]
+
+
+class HierarchicalRetriever(HierarchicalQuantizer):
+    """Wrapper to make HierarchicalQuantizer compatible with the dataset pipeline."""
+    pass
 
 
 class Sift1mDataset(Dataset):
@@ -79,7 +86,17 @@ class Sift1mDataset(Dataset):
             "test": torch.load(self.dataset_path/f"test_{self.args.noise_factor:.02f}.pt") if self.dataset_split == "test" else None
         }
 
-        # generate vector id
+        # Choose quantization method based on args
+        quantizer_type = getattr(self.args, 'quantizer', 'pq')  # default to PQ for backward compatibility
+        
+        if quantizer_type == 'hierarchical':
+            self._to_features_hierarchical(dataset, num_subspace, k)
+        else:
+            self._to_features_pq(dataset, num_subspace, k)
+    
+    def _to_features_pq(self, dataset: dict, num_subspace: int, k: int) -> None:
+        """Generate features using Product Quantization."""
+        # generate vector id using PQ
         pq = PQRetriever(M=num_subspace, Ks=k)
         if self.dataset_split == "database":
             pq.fit(dataset["database"]["key"].numpy())
@@ -90,7 +107,7 @@ class Sift1mDataset(Dataset):
         database_code = pq.encode(dataset["database"]["key"].numpy())   # (num_samples, M)
         self.codewords = torch.from_numpy(pq.codewords)                 # (M, K, vec_dim / M)
 
-        print("generate features...")
+        print("generate features using PQ...")
         database_code = torch.from_numpy(database_code).long()
         self.features = [
             Feature(x=emb.unsqueeze(dim=0), id=id, label=database_code[neighbors], neighbors=neighbors, dist=dist)
@@ -103,6 +120,35 @@ class Sift1mDataset(Dataset):
         else:
             with open(self.index_path/"id_table.json", 'r', encoding="utf-8") as f:
                 self.id_table = json.load(f)
+    
+    def _to_features_hierarchical(self, dataset: dict, num_subspace: int, k: int) -> None:
+        """Generate features using Hierarchical Clustering."""
+        from hierarchical import HierarchicalQuantizer
+        
+        quantizer_file = self.index_path / "hierarchical_quantizer.pkl"
+        
+        if self.dataset_split == "database":
+            print("Fitting hierarchical quantizer...")
+            hq = HierarchicalQuantizer(num_levels=num_subspace, num_clusters=k)
+            hq.fit(dataset["database"]["key"].numpy())
+            hq.save(self.index_path)
+        else:
+            print("Loading hierarchical quantizer...")
+            hq = HierarchicalQuantizer.load(self.index_path)
+        
+        database_code = hq.encode(dataset["database"]["key"].numpy())   # (num_samples, num_levels)
+        self.codewords = torch.from_numpy(hq.codewords)                 # (num_levels, K, vec_dim)
+
+        print("generate features using Hierarchical Clustering...")
+        database_code = torch.from_numpy(database_code).long()
+        self.features = [
+            Feature(x=emb.unsqueeze(dim=0), id=id, label=database_code[neighbors], neighbors=neighbors, dist=dist)
+            for emb, id, neighbors, dist in zip(*dataset[self.dataset_split].values())
+        ]
+        if self.dataset_split == "database":
+            self.id_table = {self.vecid_to_str(f.label[0]): f.id.item() for f in self.features}
+            with open(self.index_path/"id_table.json", 'w', encoding="utf-8") as f:
+                json.dump(self.id_table, f)
 
 
 def build_dataset(dataset_path: str, k: int, num_samples: int = None, noise_factor: float = 0.0) -> None:
