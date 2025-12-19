@@ -68,6 +68,8 @@ def constrained_beam_search(
 
         return sorted_tokids, sorted_beams
 
+    use_ivf = getattr(args, "use_ivf_pq", False)
+
     # (tokids: List[LongTensor], score: Tensor)
     beams: List[Tuple[LongTensor, Tensor]] = [
         (
@@ -75,32 +77,37 @@ def constrained_beam_search(
             torch.zeros(args.batch_size, device=q.device),
         )
     ]
-    vecid_len = args.num_subspace
-    for i in range(vecid_len):
-        seqs: List[Tensor] = [q for _ in beams]
-        tokids: LongTensor  # (batch_size, tokid_len)
-        for j, (tokids, _) in enumerate(beams):
-            if tokids.size(1) < 1:
-                continue
-            centroids = codebooks[i, tokids]  # (batch_size, tokid_len, vec_dim / M)
-            centroids = model.output_proj(centroids)  # (batch_size, tokid_len, vec_dim)
-            seqs[j] = torch.cat([seqs[j], centroids], dim=1)
-        seqs = torch.cat(seqs, dim=0)  # (num_beams * batch_size, tokid_len, vec_dim)
+
+    vecid_len = 1 + args.num_fine_subspace if use_ivf else args.num_subspace
+    vocab_size = (
+        args.num_coarse_clusters + (args.num_fine_subspace * args.num_fine_clusters)
+        if use_ivf
+        else args.num_clusters
+    )
+
+    for step in range(vecid_len):
+        seqs: List[Tensor] = [q.clone() for _ in beams]
+        if not use_ivf:
+            # Standard PQ: append predicted centroids for next step
+            for j, (tokids, _) in enumerate(beams):
+                if tokids.size(1) < 1:
+                    continue
+                centroids = codebooks[step, tokids]  # (batch, tokid_len, dim/M)
+                centroids = model.output_proj(centroids)
+                seqs[j] = torch.cat([seqs[j], centroids], dim=1)
+        # IVF-PQ: use query only for all predictions (no token history)
+
+        seqs = torch.cat(seqs, dim=0)
 
         outputs = model(decoder_inputs_embeds=seqs)
-        logits = outputs.logits[:, -1, :].view(
-            len(beams), args.batch_size, args.num_clusters
-        )
+
+        logits = outputs.logits[:, -1, :].view(len(beams), args.batch_size, vocab_size)
 
         # apply constraints
         for i, (tokids, _) in enumerate(beams):
             for j in range(args.batch_size):
                 allowed = prefix_allowed_token_fn([0] + tokids[j].tolist())
-                mask = (
-                    torch.ones(args.num_clusters)
-                    .bool()
-                    .to(logits.device, non_blocking=True)
-                )
+                mask = torch.ones(vocab_size, device=logits.device, dtype=torch.bool)
                 mask[allowed] = 0
                 logits[i, j, mask] += float("-inf")
         logprobs = logits.log_softmax(dim=-1)
@@ -109,7 +116,7 @@ def constrained_beam_search(
         for j, (tokids, score) in enumerate(beams):
             # (k, batch_size)
             topk_logp, topk_idx = torch.topk(
-                logprobs[j, ...].T, k=min(args.num_clusters, args.num_beams), dim=0
+                logprobs[j, ...].T, k=min(vocab_size, args.num_beams), dim=0
             )
             for lp, idx in zip(topk_logp, topk_idx):
                 new_tokids = torch.cat([tokids, idx.unsqueeze(1)], dim=1)
@@ -132,7 +139,7 @@ def main(args):
 
     dataset = Sift1mDataset(split="test", args=args, index_path=path)
     dataloader = DataLoader(dataset, batch_size=args.batch_size, pin_memory=True)
-    codebooks = dataset.codewords.to(device)
+    codebooks = dataset.codewords.to(device) if dataset.codewords is not None else None
 
     vecid: List[int]
     vecid_trie = Trie([[0] + vecid for vecid in dataset.vecids])

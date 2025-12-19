@@ -104,6 +104,16 @@ def get_args(file_name: str):
     parser.add_argument("--num_subspace", type=int, default=4)  # M
     parser.add_argument("--num_clusters", type=int, default=128)  # K
 
+    # IVF-PQ
+    parser.add_argument("--use_ivf_pq", action="store_true")
+    parser.add_argument(
+        "--num_coarse_clusters", type=int, default=256
+    )  # Coarse quantization
+    parser.add_argument("--num_fine_subspace", type=int, default=4)  # Fine PQ subspaces
+    parser.add_argument(
+        "--num_fine_clusters", type=int, default=128
+    )  # Fine clusters per subspace
+
     return parser.parse_args()
 
 
@@ -131,6 +141,13 @@ def load_model(args) -> T5ForPretrain:
         num_heads=args.num_heads,
         dropout_rate=args.dropout_rate,
     )
+
+    # Adjust vocab_size for IVF-PQ
+    if getattr(args, "use_ivf_pq", False):
+        config.vocab_size = args.num_coarse_clusters + (
+            args.num_fine_subspace * args.num_fine_clusters
+        )
+
     model = T5ForPretrain(config, args)
     return model
 
