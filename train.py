@@ -41,9 +41,6 @@ def compute_loss(model: T5ForPretrain, codewords: Tensor, x: Tensor, labels: Ten
         if L > 0:
             negs = labels[:, 1 : 1 + L, i]  # (B, L)
 
-            # optional: deduplicate negatives per row (nice-to-have)
-            # simple version: keep as-is
-
             pos_score = next_logits.gather(1, tokid.unsqueeze(1))  # (B,1)
             neg_score = next_logits.gather(1, negs)  # (B,L)
             scores = torch.cat([pos_score, neg_score], dim=1)  # (B,1+L)
